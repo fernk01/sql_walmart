@@ -357,3 +357,177 @@ import seaborn as sns
 sns.lineplot(data=df, x='mes', y='avg_sales', hue='Store')
 ```
 
+# Orden SQL
+Muy buena pregunta — efectivamente esa parte puede generar confusión. Vamos a verlo con calma: primero el orden lógico de ejecución de una consulta SQL (muy importante aunque la sintaxis esté en otro orden) y luego qué ocurre con expresiones como `YEAR(Date)` vs `SUM(Weekly_Sales)`.
+
+---
+
+## 🧭 Orden lógico de ejecución de una sentencia `SELECT`
+
+Aunque escribes la consulta en un cierto orden (`SELECT … FROM … WHERE … GROUP BY … ORDER BY …`), internamente un motor SQL la “procesa” en otro orden lógico. Por ejemplo:
+
+1. `FROM` (y `JOIN`-s) → se determina de qué tabla(s) salen las filas. ([SQLBolt][1])
+2. `WHERE` → filtra las filas individuales antes de agrupar. ([GeeksforGeeks][2])
+3. `GROUP BY` → agrupa esas filas filtradas según los criterios de agrupación. ([SQLBolt][1])
+4. `HAVING` → (si existe) filtra los grupos resultantes después de la agrupación. ([GeeksforGeeks][2])
+5. `SELECT` → selecciona qué columnas o expresiones mostrar, junto con los alias, funciones de agregación calculadas, etc. ([Nitpickings][3])
+6. `ORDER BY` → ordena las filas finales. ([GeeksforGeeks][2])
+7. `LIMIT` / `OFFSET` (o similares) → recorta el conjunto de resultados si procede. ([DolphinDB][4])
+
+Entonces aunque el `SELECT` aparece al principio en la consulta escrita, en el “orden lógico de procesamiento” aparece **después** del `GROUP BY` y del `HAVING`. ([Nitpickings][3])
+
+---
+
+## 🔍 ¿Y qué pasa con `YEAR(Date)` vs `SUM(Weekly_Sales)`?
+
+Cuando tienes una consulta como:
+
+```sql
+SELECT
+   YEAR(Date) AS year,
+   SUM(Weekly_Sales) AS total_sales
+FROM sales
+GROUP BY YEAR(Date)
+```
+
+Aquí:
+
+* `YEAR(Date) AS year`: esta es una expresión que opera por fila, extrae el año de la columna `Date` para cada fila. Ese valor luego se usa **en el agrupamiento** (al agrupar por `YEAR(Date)`) para “agrupar” las filas que tienen el mismo año. Luego el resultado muestra una columna `year` que indica ese valor común por cada grupo.
+* `SUM(Weekly_Sales) AS total_sales`: es una función de agregación. Qué significa: para cada grupo definido por el `GROUP BY` (en este caso, para cada año), se suma el valor de `Weekly_Sales` de todas las filas de ese grupo. El resultado es un valor único (un escalar) por cada grupo.
+
+Entonces, **sí**: `YEAR(Date)` produce un valor por fila que luego entra en el agrupamiento; `SUM(Weekly_Sales)` produce un valor agregado *por grupo*. En el resultado final de la consulta, ambos son “columnas”, pero su naturaleza es diferente:
+
+* La columna `year` es más bien “el identificador del grupo” (por cada año).
+* La columna `total_sales` es el resumen agregado de las ventas para ese grupo.
+
+Porque en el paso lógico del `SELECT`, ya se tiene el conjunto de grupos creado por `GROUP BY`, luego se calcula las expresiones del `SELECT` (como `YEAR(Date)` repetido o alias, y la agregación), luego se ordena, etc.
+
+---
+
+## ✅ En resumen
+
+Tu interpretación estaba bastante bien, pero es útil tener presente que:
+
+* Aunque escribes `YEAR(Date)` y `SUM(Weekly_Sales)` en el `SELECT`, el agrupamiento ya se ha realizado antes de “mostrar” esos resultados.
+* `YEAR(Date)` sirve como “clave de agrupamiento” pues aparece en `GROUP BY` (o podría aparecer exactamente la misma expresión) y define cada grupo.
+* `SUM(Weekly_Sales)` aplica sobre cada uno de esos grupos y da un escalar por grupo.
+* Luego se muestran ambas “columnas” en el resultado final.
+
+---
+
+Si quieres, te puedo mandar un **gráfico de flujo visual** (diagrama) que muestre los pasos internos de una consulta `SELECT` típica, con anillos mostrando dónde “entra” la extracción del año, la agregación, etc., para que quede más claro. ¿Te lo preparo?
+
+[1]: https://sqlbolt.com/lesson/select_queries_order_of_execution?utm_source=chatgpt.com "SQLBolt - Learn SQL - SQL Lesson 12: Order of execution of a Query"
+[2]: https://www.geeksforgeeks.org/order-of-execution-of-sql-queries/?utm_source=chatgpt.com "Order of Execution of SQL Queries - GeeksforGeeks"
+[3]: https://nitpickings.com/docs/sql/query-execution-order?utm_source=chatgpt.com "Query Execution Order | Nitpickings"
+[4]: https://docs.dolphindb.com/en/3.00.3/Programming/SQLStatements/orderOfExecute.html?utm_source=chatgpt.com "Order of Execution"
+
+# Ejemplo.
+Muy buena iniciativa — vamos a desglosar **paso a paso** la consulta que compartiste, y ver cuál es el **orden lógico de ejecución** en SQL (es decir, cómo “piensa” internamente la base de datos) para que quede claro. También veremos cómo encajan los Common Table Expression (CTE) con ese orden.
+
+---
+
+## 🔍 Consulta que analizamos
+
+```sql
+WITH yearly_sales AS (
+  SELECT
+    YEAR(s.Date) AS year,
+    SUM(s.Weekly_Sales) AS total_sales
+  FROM sales s
+  GROUP BY YEAR(s.Date)
+),
+top_year AS (
+  SELECT year
+  FROM yearly_sales
+  ORDER BY total_sales DESC
+  LIMIT 1
+)
+SELECT
+  YEAR(w.Date) AS year,
+  AVG(w.Temperature) AS avg_temperature,
+  AVG(w.Fuel_Price) AS avg_fuel_price,
+  AVG(w.CPI) AS avg_cpi,
+  AVG(w.Unemployment) AS avg_unemployment
+FROM sales w
+JOIN top_year ty ON YEAR(w.Date) = ty.year
+GROUP BY YEAR(w.Date);
+```
+
+Vamos verlo parte por parte.
+
+---
+
+## 🧮 Paso a paso con el orden lógico de ejecución
+
+### 1. Evaluación de los CTEs (`WITH …`)
+
+* Cuando aparece `WITH yearly_sales AS (…) , top_year AS (…)`, se están definiendo consultas intermedias (CTEs) que pueden usarse luego en el cuerpo principal.
+* Lógicamente, la base de datos “evalúa” (o al menos resuelve) `yearly_sales` primero, para luego usar su resultado al construir `top_year`.
+* Entonces:
+
+  * Construye `yearly_sales`: agrupa ventas por año, suma `Weekly_Sales`.
+  * Luego construye `top_year`: selecciona el año con mayor `total_sales`.
+* Estas definiciones ocurren antes de que la consulta principal se “ejecute” sobre esas tablas derivadas.
+
+### 2. FROM / JOIN en la consulta principal
+
+* Ya definido `top_year`, la consulta principal tiene `FROM sales w JOIN top_year ty ON YEAR(w.Date) = ty.year`.
+* Lógicamente, primero se identifica la tabla `sales w`. Luego se “une” (JOIN) con `top_year ty` usando la condición `YEAR(w.Date) = ty.year`. (La lógica de ejecución del `JOIN` puede considerarse parte del “FROM” fase).
+* En el orden lógico estándar: `FROM` → `JOIN`.
+
+### 3. WHERE (si la hubiera)
+
+* En esta consulta no hay cláusula `WHERE` explícita en la parte principal, así que ese paso se omite aquí.
+
+### 4. GROUP BY
+
+* Luego de construir el conjunto de filas mediante FROM + JOIN, se ejecuta el `GROUP BY YEAR(w.Date)` de la consulta principal.
+* Este paso agrupa los registros por año (pero dado que el JOIN ya limita a un solo año —el “top year”— en realidad agrupa todas las filas de ese año en un único grupo).
+* Al agrupar, las funciones de agregación (`AVG`, etc.) se pueden calcular.
+
+### 5. SELECT
+
+* Después de haber agrupado, se calcula las columnas del `SELECT`: `YEAR(w.Date) AS year`, `AVG(w.Temperature)`, `AVG(w.Fuel_Price)`, etc.
+* Aquí los alias se asignan, se calculan los valores agregados, etc.
+* Nota: Aunque `YEAR(w.Date)` aparece en el `SELECT`, ya se utilizó en `GROUP BY`, lo cual es coherente.
+
+### 6. ORDER BY / LIMIT (si se usan)
+
+* En esta consulta **no** hay `ORDER BY` ni `LIMIT` en la parte principal (aunque sí en `top_year`). Si hubiera, ese sería el siguiente paso lógico: ordenar y luego limitar.
+* En `top_year` hay un `ORDER BY total_sales DESC LIMIT 1`, lo que se ejecuta dentro del CTE para obtener ese año.
+
+---
+
+## 📋 Orden lógico resumen para esta consulta
+
+Podemos resumir:
+
+1. Evaluar `yearly_sales` (agrupación de ventas por año)
+2. Evaluar `top_year` (selección del año con mayor ventas)
+3. En la consulta principal:
+
+   * FROM `sales w`
+   * JOIN `top_year ty`
+   * GROUP BY `YEAR(w.Date)`
+   * SELECT los agregados (`AVG`, etc) junto con `YEAR(w.Date)`
+4. Resultado final devuelto.
+
+Y si hubiera `ORDER BY` o `LIMIT` al final de la consulta principal, se aplicarían después del `SELECT`.
+
+---
+
+## ✅ Aspectos clave a recordar
+
+* Escribir la consulta con `SELECT … FROM … WHERE … GROUP BY …` no significa que la base de datos la ejecute en ese orden. El orden lógico real comienza con `FROM` (y `JOIN`) como primer paso. ([GeeksforGeeks][1])
+* Los CTEs (`WITH`) se evalúan “antes” de la consulta principal en términos lógicos.
+* Las funciones de agregación (`SUM`, `AVG`, etc) sólo se calculan después del `GROUP BY`.
+* No es posible referenciar alias definidos en `SELECT` en el `WHERE` o `GROUP BY`, porque `SELECT` se ejecuta más tarde. ([HubSite 365][2])
+* El `ORDER BY` y `LIMIT` ocurren al final del procesamiento lógico.
+
+---
+
+Si quieres, puedo hacerte **un diagrama gráfico** que muestre esta consulta específica (con los CTEs) y cómo fluyen los datos por cada paso. ¿Te lo preparo?
+
+[1]: https://www.geeksforgeeks.org/order-of-execution-of-sql-queries/?utm_source=chatgpt.com "Order of Execution of SQL Queries - GeeksforGeeks"
+[2]: https://www.hubsite365.com/en-ww/crm-pages/sql-order-of-operations-broken-down.htm?utm_source=chatgpt.com "SQL Order of Operations Simplified"
